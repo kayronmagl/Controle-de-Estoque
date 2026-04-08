@@ -1,16 +1,48 @@
 "use strict";
 
-const supabaseUrl = "https://tehaofdyrhzvqvwrevye.supabase.co";
-const supabasePublishableKey = "sb_publishable_7pEMqm6zURvQkYP57zRzFA_kUUN6idt";
+const supabaseUrl = "https://bmxlvsxluwcxuydnlawc.supabase.co";
+const supabasePublishableKey = "sb_publishable_jWyWeiYTnu4c8UllXXvm3g_0meVpJM2";
+const AUTO_REFRESH_INTERVAL_MS = 15000;
 
 const state = {
   view: "products",
   products: [],
   history: [],
+  productSearch: "",
+  productTypeFilter: "all",
   pendingIds: new Set(),
   isCreating: false,
   logoutRequested: false,
   session: null,
+  productsUpdatedAt: null,
+  historyUpdatedAt: null,
+  autoRefreshTimerId: null,
+};
+
+const PRODUCT_TYPE_LABELS = {
+  ingrediente: "Ingrediente",
+  bebida: "Bebida",
+  insumo: "Insumo",
+  produto_preparado: "Preparado",
+};
+
+const PRODUCT_TYPE_ORDER = {
+  ingrediente: 0,
+  bebida: 1,
+  insumo: 2,
+  produto_preparado: 3,
+};
+
+const STOCK_UNIT_LABELS = {
+  un: { short: "un", singular: "unidade", plural: "unidades" },
+  kg: { short: "kg", singular: "kg", plural: "kg" },
+  g: { short: "g", singular: "g", plural: "g" },
+  l: { short: "l", singular: "l", plural: "l" },
+  ml: { short: "ml", singular: "ml", plural: "ml" },
+  lata: { short: "lata", singular: "lata", plural: "latas" },
+  garrafa: { short: "garrafa", singular: "garrafa", plural: "garrafas" },
+  pct: { short: "pct", singular: "pacote", plural: "pacotes" },
+  cx: { short: "cx", singular: "caixa", plural: "caixas" },
 };
 
 const els = {
@@ -35,7 +67,11 @@ const els = {
   alertsEmptyState: document.getElementById("alertsEmptyState"),
   createProductForm: document.getElementById("createProductForm"),
   createProductButton: document.getElementById("createProductButton"),
+  productSearch: document.getElementById("productSearch"),
+  productTypeFilters: document.getElementById("productTypeFilters"),
   accessModeNote: document.getElementById("accessModeNote"),
+  productsRuntimeSummary: document.getElementById("productsRuntimeSummary"),
+  historyRuntimeSummary: document.getElementById("historyRuntimeSummary"),
   metricTotal: document.getElementById("metricTotal"),
   metricOk: document.getElementById("metricOk"),
   metricLow: document.getElementById("metricLow"),
@@ -58,6 +94,8 @@ document.addEventListener("DOMContentLoaded", initializeApp);
 
 async function initializeApp() {
   bindEvents();
+  syncTypeFilterState();
+  resetCreateForm();
   renderProducts();
   renderHistory();
   setAuthenticated(false);
@@ -93,6 +131,10 @@ function bindEvents() {
   els.refreshButton.addEventListener("click", handleRefresh);
   els.productList.addEventListener("click", handleProductAction);
   els.createProductForm.addEventListener("submit", handleCreateProduct);
+  els.productSearch.addEventListener("input", handleProductSearch);
+  els.productTypeFilters.addEventListener("click", handleTypeFilterClick);
+  window.addEventListener("focus", handleWindowFocus);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
 }
 
 async function applySession(session, silent = false) {
@@ -102,6 +144,7 @@ async function applySession(session, silent = false) {
 
   state.session = session || null;
   setAuthenticated(Boolean(session?.user));
+  syncAutoRefresh();
 
   if (!state.session) {
     if (sessionChanged || !silent) {
@@ -185,7 +228,7 @@ async function handleSignIn(event) {
   showAuthNotice("Validando acesso...", "warning", true);
 
   try {
-    const { error } = await supabaseClient.auth.signInWithPassword({
+    const { data, error } = await supabaseClient.auth.signInWithPassword({
       email,
       password,
     });
@@ -194,6 +237,16 @@ async function handleSignIn(event) {
       throw error;
     }
 
+    const activeSession =
+      data?.session ||
+      (await supabaseClient.auth.getSession()).data.session ||
+      null;
+
+    if (!activeSession?.user) {
+      throw new Error("Sessao de login nao retornada.");
+    }
+
+    await applySession(activeSession);
     showAuthNotice("Acesso validado. Carregando painel...", "success", true);
     els.authForm.reset();
   } catch (error) {
@@ -208,18 +261,22 @@ async function handleSignOut() {
     return;
   }
 
+  if (state.logoutRequested) {
+    return;
+  }
+
   els.signOutButton.disabled = true;
+  state.logoutRequested = true;
+  await applySession(null, true);
 
   try {
-    state.logoutRequested = true;
-    const { error } = await supabaseClient.auth.signOut();
+    const { error } = await supabaseClient.auth.signOut({ scope: "local" });
 
     if (error) {
       throw error;
     }
   } catch (error) {
-    state.logoutRequested = false;
-    showNotice(getErrorMessage(error, "Nao foi possivel encerrar a sessao."), "error", true);
+    showAuthNotice(getErrorMessage(error, "Nao foi possivel encerrar a sessao."), "error", true);
   } finally {
     els.signOutButton.disabled = false;
   }
@@ -231,12 +288,7 @@ async function handleRefresh() {
     return;
   }
 
-  if (state.view === "history") {
-    await fetchHistory();
-    return;
-  }
-
-  await fetchProducts();
+  await refreshActiveData();
 }
 
 function setView(view) {
@@ -245,6 +297,10 @@ function setView(view) {
   els.historyTab.classList.toggle("is-active", view === "history");
   els.productsView.classList.toggle("is-active", view === "products");
   els.historyView.classList.toggle("is-active", view === "history");
+
+  if (view === "products" && state.session) {
+    fetchProducts(true);
+  }
 
   if (view === "history" && state.session) {
     fetchHistory();
@@ -261,16 +317,16 @@ async function fetchProducts(silent = false) {
   }
 
   try {
-    const { data, error } = await supabaseClient
-      .from("products")
-      .select("id, name, quantity, min_quantity, created_at")
-      .order("name", { ascending: true });
+    const { data, error } = await supabaseClient.rpc("list_products");
 
     if (error) {
       throw error;
     }
 
-    state.products = Array.isArray(data) ? data : [];
+    state.products = sortProducts(
+      (Array.isArray(data) ? data : []).filter((product) => product?.is_active !== false),
+    );
+    state.productsUpdatedAt = new Date().toISOString();
     renderProducts();
     clearNotice();
   } catch (error) {
@@ -288,22 +344,48 @@ async function fetchHistory(silent = false) {
   }
 
   try {
-    const { data, error } = await supabaseClient
-      .from("movements")
-      .select("id, product_id, type, quantity, previous_quantity, result_quantity, created_at, products(name)")
-      .order("created_at", { ascending: false })
-      .limit(30);
+    const { data, error } = await supabaseClient.rpc("list_movements");
 
     if (error) {
       throw error;
     }
 
-    state.history = Array.isArray(data) ? data : [];
+    state.history = (Array.isArray(data) ? data : []).slice(0, 30);
+    state.historyUpdatedAt = new Date().toISOString();
     renderHistory();
     clearNotice();
   } catch (error) {
     showNotice(getErrorMessage(error, "Nao foi possivel carregar o historico."), "error", true);
   }
+}
+
+function handleProductSearch(event) {
+  state.productSearch = String(event.target.value || "").trim().toLowerCase();
+  renderProducts();
+}
+
+function handleTypeFilterClick(event) {
+  const button = event.target.closest("[data-type-filter]");
+
+  if (!button) {
+    return;
+  }
+
+  state.productTypeFilter = button.dataset.typeFilter || "all";
+  syncTypeFilterState();
+  renderProducts();
+}
+
+async function handleWindowFocus() {
+  await refreshActiveData(true);
+}
+
+async function handleVisibilityChange() {
+  if (document.hidden) {
+    return;
+  }
+
+  await refreshActiveData(true);
 }
 
 async function handleProductAction(event) {
@@ -339,6 +421,8 @@ async function handleCreateProduct(event) {
 
   const formData = new FormData(els.createProductForm);
   const name = String(formData.get("name") || "").trim();
+  const productType = String(formData.get("product_type") || "ingrediente").trim();
+  const stockUnit = String(formData.get("stock_unit") || "un").trim();
   const quantity = Number.parseInt(String(formData.get("quantity") || "0"), 10);
   const minQuantity = Number.parseInt(String(formData.get("min_quantity") || "0"), 10);
 
@@ -354,6 +438,16 @@ async function handleCreateProduct(event) {
 
   if (!Number.isInteger(minQuantity) || minQuantity < 1) {
     showNotice("O minimo ideal precisa ser um inteiro maior ou igual a um.", "error", true);
+    return;
+  }
+
+  if (!PRODUCT_TYPE_LABELS[productType]) {
+    showNotice("Selecione um tipo de item valido.", "error", true);
+    return;
+  }
+
+  if (!STOCK_UNIT_LABELS[stockUnit]) {
+    showNotice("Selecione uma unidade valida.", "error", true);
     return;
   }
 
@@ -375,6 +469,8 @@ async function handleCreateProduct(event) {
       p_name: name,
       p_initial_quantity: quantity,
       p_min_quantity: minQuantity,
+      p_product_type: productType,
+      p_stock_unit: stockUnit,
     });
 
     if (error) {
@@ -448,23 +544,22 @@ async function updateStock(id, type) {
 function renderProducts() {
   els.productList.innerHTML = "";
 
+  const visibleProducts = getVisibleProducts();
   const metrics = {
-    total: state.products.length,
+    total: visibleProducts.length,
     ok: 0,
     low: 0,
     critical: 0,
   };
 
-  if (state.products.length === 0) {
+  if (visibleProducts.length === 0) {
     els.productsEmptyState.hidden = false;
-    els.productsEmptyState.textContent = state.session
-      ? "Nenhum produto encontrado. Cadastre itens na tabela products para iniciar o controle."
-      : "Entre no sistema para carregar os produtos cadastrados.";
+    els.productsEmptyState.textContent = buildProductsEmptyStateMessage();
   } else {
     els.productsEmptyState.hidden = true;
   }
 
-  state.products.forEach((product) => {
+  visibleProducts.forEach((product) => {
     const status = getStatus(product.quantity, product.min_quantity);
     metrics[status.key] += 1;
 
@@ -475,8 +570,20 @@ function renderProducts() {
     card.classList.toggle("is-pending", pending);
     card.classList.add(`product-card-${status.key}`);
     card.querySelector(".product-name").textContent = product.name;
-    card.querySelector(".product-min").textContent = product.min_quantity ?? 5;
+    card.querySelector(".product-type-badge").textContent = getProductTypeLabel(product.product_type);
+    card.querySelector(".product-unit-badge").textContent = getUnitShortLabel(product.stock_unit);
+    card.querySelector(".product-min").textContent = String(product.min_quantity ?? 5);
+    card.querySelector(".product-unit").textContent = getUnitShortLabel(product.stock_unit);
     card.querySelector(".quantity-value").textContent = String(product.quantity ?? 0);
+    card.querySelector(".quantity-unit").textContent = getUnitLabel(product.stock_unit, product.quantity ?? 0);
+    card.querySelector(".stock-note").textContent = buildProductStockNote(product, status);
+
+    const quantityBlock = card.querySelector(".quantity-block");
+    quantityBlock.classList.add(`quantity-block-${status.key}`);
+
+    const stockProgressFill = card.querySelector(".stock-progress-fill");
+    stockProgressFill.style.width = `${getStockProgressPercentage(product.quantity, product.min_quantity)}%`;
+    stockProgressFill.classList.add(`stock-progress-fill-${status.key}`);
 
     const statusBadge = card.querySelector(".status-badge");
     statusBadge.textContent = status.label;
@@ -493,6 +600,12 @@ function renderProducts() {
   els.metricOk.textContent = String(metrics.ok);
   els.metricLow.textContent = String(metrics.low);
   els.metricCritical.textContent = String(metrics.critical);
+  if (els.productsRuntimeSummary) {
+    els.productsRuntimeSummary.textContent = buildProductsRuntimeSummary(
+      visibleProducts.length,
+      state.products.length,
+    );
+  }
   renderAlerts();
 }
 
@@ -503,24 +616,43 @@ function renderHistory() {
     els.historyEmptyState.hidden = false;
     els.historyEmptyState.textContent =
       "As movimentacoes mais recentes vao aparecer aqui em ordem decrescente.";
+    if (els.historyRuntimeSummary) {
+      els.historyRuntimeSummary.textContent = buildHistoryRuntimeSummary(0);
+    }
     return;
   }
 
   els.historyEmptyState.hidden = true;
+  if (els.historyRuntimeSummary) {
+    els.historyRuntimeSummary.textContent = buildHistoryRuntimeSummary(state.history.length);
+  }
 
   state.history.forEach((movement) => {
     const card = els.historyCardTemplate.content.firstElementChild.cloneNode(true);
     const productName = movement.products?.name || "Produto removido";
+    const stockUnit = movement.products?.stock_unit || "un";
+    const historyFlow = getHistoryFlow(movement);
 
+    card.classList.add(`history-card-${movement.type}`);
     card.querySelector(".history-product").textContent = productName;
     card.querySelector(".history-summary").textContent = formatMovementSummary(movement);
+    card.querySelector(".history-detail").textContent = buildHistoryDetail(movement);
     card.querySelector(".history-date").textContent = formatDate(movement.created_at);
 
+    const historyFlowNode = card.querySelector(".history-flow");
+
+    if (historyFlow) {
+      card.querySelector(".history-flow-before").textContent = historyFlow.before;
+      card.querySelector(".history-flow-after").textContent = historyFlow.after;
+    } else {
+      historyFlowNode.hidden = true;
+    }
+
     const typeNode = card.querySelector(".history-type");
-    typeNode.textContent = movement.type;
+    typeNode.textContent = capitalize(movement.type);
     typeNode.classList.add(`history-type-${movement.type}`);
 
-    card.querySelector(".history-quantity").textContent = `${movement.quantity} unidade(s)`;
+    card.querySelector(".history-quantity").textContent = formatQuantityWithUnit(movement.quantity, stockUnit);
     els.historyList.appendChild(card);
   });
 }
@@ -612,32 +744,21 @@ function formatDate(value) {
 
 function formatMovementSummary(movement) {
   const amount = Number(movement.quantity) || 0;
-  const previousQuantity =
-    movement.previous_quantity !== null && movement.previous_quantity !== undefined
-      ? Number(movement.previous_quantity)
-      : null;
-  const resultQuantity =
-    movement.result_quantity !== null && movement.result_quantity !== undefined
-      ? Number(movement.result_quantity)
-      : null;
-
-  if (previousQuantity !== null && resultQuantity !== null) {
-    return `${capitalize(movement.type)} de ${amount} unidade(s): ${previousQuantity} -> ${resultQuantity}`;
-  }
-
-  return `${capitalize(movement.type)} de ${amount} unidade(s) registrada.`;
+  const stockUnit = movement.products?.stock_unit || "un";
+  return `${capitalize(movement.type)} de ${formatQuantityWithUnit(amount, stockUnit)}`;
 }
 
 function buildAlertMessage(product, status) {
   const quantity = Number(product.quantity) || 0;
   const minimum = Number(product.min_quantity) || 5;
   const missing = Math.max(0, minimum - quantity);
+  const stockUnit = product.stock_unit || "un";
 
   if (status.key === "critical") {
-    return `Nivel critico: ${quantity} unidade(s) em estoque. Reponha ${missing || 1} ou mais para sair da zona critica.`;
+    return `Nivel critico: ${formatQuantityWithUnit(quantity, stockUnit)} em estoque. Reponha ${formatQuantityWithUnit(missing || 1, stockUnit)} ou mais para sair da zona critica.`;
   }
 
-  return `Estoque baixo: ${quantity} unidade(s) disponiveis. O minimo ideal configurado e ${minimum}.`;
+  return `Estoque baixo: ${formatQuantityWithUnit(quantity, stockUnit)} disponiveis. O minimo ideal configurado e ${formatQuantityWithUnit(minimum, stockUnit)}.`;
 }
 
 function buildStockNotice(product, type) {
@@ -770,6 +891,216 @@ function capitalize(value) {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
+function getProductTypeLabel(productType) {
+  return PRODUCT_TYPE_LABELS[productType] || "Item";
+}
+
+function getUnitShortLabel(stockUnit) {
+  return STOCK_UNIT_LABELS[stockUnit]?.short || "un";
+}
+
+function getUnitLabel(stockUnit, quantity = 1) {
+  const unitMeta = STOCK_UNIT_LABELS[stockUnit] || STOCK_UNIT_LABELS.un;
+
+  return quantity === 1 ? unitMeta.singular : unitMeta.plural;
+}
+
+function formatQuantityWithUnit(quantity, stockUnit) {
+  const safeQuantity = Number(quantity) || 0;
+
+  return `${safeQuantity} ${getUnitLabel(stockUnit, safeQuantity)}`;
+}
+
+function buildProductsRuntimeSummary(visibleCount, totalCount) {
+  const lastSync = formatSyncTime(state.productsUpdatedAt);
+
+  if (!state.session) {
+    return "Sem sessao ativa.";
+  }
+
+  if (totalCount === 0) {
+    return `Nenhum item carregado${lastSync ? ` · ${lastSync}` : ""}`;
+  }
+
+  if (visibleCount !== totalCount) {
+    return `${visibleCount} de ${totalCount} itens visiveis · ${lastSync}`;
+  }
+
+  return `${totalCount} itens carregados · ${lastSync}`;
+}
+
+function buildHistoryRuntimeSummary(totalCount) {
+  const lastSync = formatSyncTime(state.historyUpdatedAt);
+
+  if (!state.session) {
+    return "Sem sessao ativa.";
+  }
+
+  return `${totalCount} registros recentes · ${lastSync}`;
+}
+
+function formatSyncTime(value) {
+  if (!value) {
+    return "aguardando sincronizacao";
+  }
+
+  return `atualizado ${new Intl.DateTimeFormat("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value))}`;
+}
+
+function getStockProgressPercentage(quantity, minQuantity) {
+  const safeQuantity = Math.max(0, Number(quantity) || 0);
+  const safeMin = Math.max(1, Number(minQuantity) || 1);
+
+  return Math.min(100, Math.round((safeQuantity / safeMin) * 100));
+}
+
+function buildProductStockNote(product, status) {
+  const quantity = Number(product.quantity) || 0;
+  const minimum = Math.max(1, Number(product.min_quantity) || 1);
+  const stockUnit = product.stock_unit || "un";
+  const missing = Math.max(0, minimum - quantity);
+  const surplus = Math.max(0, quantity - minimum);
+
+  if (status.key === "critical") {
+    if (quantity === 0) {
+      return `Item zerado. Reponha ${formatQuantityWithUnit(minimum, stockUnit)} para normalizar o estoque.`;
+    }
+
+    return `Faltam ${formatQuantityWithUnit(missing, stockUnit)} para sair do nivel critico.`;
+  }
+
+  if (status.key === "low") {
+    return `Faltam ${formatQuantityWithUnit(missing, stockUnit)} para atingir o minimo ideal.`;
+  }
+
+  if (surplus === 0) {
+    return "Estoque exatamente no minimo ideal configurado.";
+  }
+
+  return `${formatQuantityWithUnit(surplus, stockUnit)} acima do minimo ideal.`;
+}
+
+function buildHistoryDetail(movement) {
+  const productType = getProductTypeLabel(movement.products?.product_type);
+  const unitShort = getUnitShortLabel(movement.products?.stock_unit);
+  const reason = getMovementReasonLabel(movement.reason);
+
+  return `${productType} | ${unitShort} | ${reason}`;
+}
+
+function getHistoryFlow(movement) {
+  const stockUnit = movement.products?.stock_unit || "un";
+  const previousQuantity =
+    movement.previous_quantity !== null && movement.previous_quantity !== undefined
+      ? Number(movement.previous_quantity)
+      : null;
+  const resultQuantity =
+    movement.result_quantity !== null && movement.result_quantity !== undefined
+      ? Number(movement.result_quantity)
+      : null;
+
+  if (previousQuantity === null || resultQuantity === null) {
+    return null;
+  }
+
+  return {
+    before: formatQuantityWithUnit(previousQuantity, stockUnit),
+    after: formatQuantityWithUnit(resultQuantity, stockUnit),
+  };
+}
+
+function getMovementReasonLabel(reason) {
+  const reasonLabels = {
+    cadastro_inicial: "Cadastro inicial",
+    entrada_manual: "Entrada manual",
+    saida_manual: "Saida manual",
+    ajuste_manual: "Ajuste manual",
+    correcao: "Correcao",
+    reposicao: "Reposicao",
+    perda: "Perda",
+  };
+
+  return reasonLabels[reason] || "Movimentacao";
+}
+
+function syncTypeFilterState() {
+  els.productTypeFilters.querySelectorAll("[data-type-filter]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.typeFilter === state.productTypeFilter);
+  });
+}
+
+function getVisibleProducts() {
+  const searchTerm = state.productSearch;
+
+  return state.products.filter((product) => {
+    const matchesType =
+      state.productTypeFilter === "all" || product.product_type === state.productTypeFilter;
+    const matchesSearch =
+      !searchTerm || String(product.name || "").toLowerCase().includes(searchTerm);
+
+    return matchesType && matchesSearch;
+  });
+}
+
+function buildProductsEmptyStateMessage() {
+  if (!state.session) {
+    return "Entre no sistema para carregar os produtos cadastrados.";
+  }
+
+  if (state.products.length === 0) {
+    return "Nenhum produto encontrado. Cadastre itens na tabela products para iniciar o controle.";
+  }
+
+  return "Nenhum item corresponde aos filtros atuais.";
+}
+
+function sortProducts(products) {
+  return [...products].sort((left, right) => {
+    const typeDiff =
+      (PRODUCT_TYPE_ORDER[left.product_type] ?? 99) - (PRODUCT_TYPE_ORDER[right.product_type] ?? 99);
+
+    if (typeDiff !== 0) {
+      return typeDiff;
+    }
+
+    return String(left.name || "").localeCompare(String(right.name || ""), "pt-BR");
+  });
+}
+
+async function refreshActiveData(silent = false) {
+  if (!supabaseClient || !state.session) {
+    return;
+  }
+
+  await fetchProducts(silent);
+
+  if (state.view === "history") {
+    await fetchHistory(silent);
+  }
+}
+
+function syncAutoRefresh() {
+  if (state.autoRefreshTimerId) {
+    window.clearInterval(state.autoRefreshTimerId);
+    state.autoRefreshTimerId = null;
+  }
+
+  if (!state.session) {
+    return;
+  }
+
+  state.autoRefreshTimerId = window.setInterval(() => {
+    if (document.hidden) {
+      return;
+    }
+
+    refreshActiveData(true);
+  }, AUTO_REFRESH_INTERVAL_MS);
+}
+
 function ensureWriteAccess() {
   if (state.session) {
     return true;
@@ -799,6 +1130,8 @@ function syncCreateFormState() {
 
 function resetCreateForm() {
   els.createProductForm.reset();
+  els.createProductForm.elements.namedItem("product_type").value = "ingrediente";
+  els.createProductForm.elements.namedItem("stock_unit").value = "un";
   els.createProductForm.elements.namedItem("quantity").value = "0";
   els.createProductForm.elements.namedItem("min_quantity").value = "5";
 }
@@ -806,8 +1139,20 @@ function resetCreateForm() {
 function resetState() {
   state.products = [];
   state.history = [];
+  state.productSearch = "";
+  state.productTypeFilter = "all";
   state.pendingIds.clear();
   state.isCreating = false;
+  state.productsUpdatedAt = null;
+  state.historyUpdatedAt = null;
+  els.productSearch.value = "";
+  if (els.productsRuntimeSummary) {
+    els.productsRuntimeSummary.textContent = "";
+  }
+  if (els.historyRuntimeSummary) {
+    els.historyRuntimeSummary.textContent = "";
+  }
+  syncTypeFilterState();
   syncCreateFormState();
   renderProducts();
   renderHistory();
