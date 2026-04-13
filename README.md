@@ -39,7 +39,7 @@ Especialmente em um **quiosque**, é fácil se perder no que tem ou não dispon�
 
 ## Tecnologias Utilizadas
 *   **Frontend:** HTML5, CSS3 e JavaScript Vanilla (ES6+).
-*   **Backend e Banco de Dados:** Supabase (BaaS).
+*   **Backend e Banco de Dados:** Supabase (BaaS) com lógica em PL/pgSQL.
 *   **Hospedagem:** Vercel.
 
 ## Configuração do Banco de Dados
