@@ -2,7 +2,7 @@
   <h1>Controle de Estoque - Tobias Lanches</h1>
   <p><b>Gestão de inventário e persistência de dados integrada para o nosso quiosque</b></p>
   <br>
-  <a href="https://vercel.app">
+  <a href="https://controle-de-estoque-eta-orpin.vercel.app/">
     <b>VISUALIZAR PROJETO ONLINE</b>
   </a>
 </div>
