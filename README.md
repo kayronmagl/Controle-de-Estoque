@@ -53,3 +53,15 @@ CREATE TABLE produtos (
   preco NUMERIC,
   descricao TEXT
 );
+```
+
+<h2 align="left">Licença e Uso</h2>
+<p align="justify">
+  Este projeto é de <b>uso restrito e exclusivo</b> ao nosso quiosque, disponível apenas para visualização e consulta interna. Não é permitida a distribuição, modificação ou uso comercial do código sem autorização prévia. Todos os direitos são reservados ao autor.
+</p>
+
+<br>
+
+<div align="center">
+  <p>Desenvolvido por <b>Kayron Magalhães</b></p>
+</div>
